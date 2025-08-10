@@ -15,7 +15,6 @@ public:
   void map(pagetable_t, uint64, uint64, uint64, int);
   int mappages(pagetable_t, uint64, uint64, uint64, int);
   pagetable_t create(void);
-  void first(pagetable_t, uchar*, uint);
   uint64 alloc(pagetable_t, uint64, uint64, int);
   uint64 dealloc(pagetable_t, uint64, uint64);
   void unmap(pagetable_t, uint64, uint64, int);

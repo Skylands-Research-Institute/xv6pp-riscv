@@ -113,7 +113,7 @@ void uart16550_driver::putc(int c) {
 }
 
 int uart16550_driver::getc() {
-  if (ReadReg(LSR) & 0x01) {
+  if (ReadReg(LSR) & LSR_RX_READY) {
     // input data is ready.
     return ReadReg(RHR);
   } else {

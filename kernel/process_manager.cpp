@@ -40,6 +40,12 @@ int process_manager::get_next_pid() {
 }
 
 void process_manager::initial_process() {
+  auto p = alloc();
+  initprocess = p;
+  p->cwd = kernel.fsystem.namei((char*)"/");
+  p->state = process::process_state::RUNNABLE;
+  p->lock.release();
+#if 0
   // a user program that calls exec("/init")
   // assembled from ../user/initcode.S
   // od -t xC ../user/initcode
@@ -61,6 +67,7 @@ void process_manager::initial_process() {
   p->cwd = kernel.fsystem.namei((char*) "/");
   p->state = process::process_state::RUNNABLE;
   p->lock.release();
+#endif
 }
 
 process* process_manager::alloc() {
@@ -126,6 +133,15 @@ void process_manager::forkret() {
     first = false;
     // ensure other cores see first=0.
     __sync_synchronize();
+    // We can invoke exec() now that file system is initialized.
+    // Put the return value (argc) of exec into a0.
+    process* p = kernel.processes.initprocess;
+    static char init[] = "/init";   // non-const to satisfy char*
+    char* argv[] = { init, nullptr };
+    p->trapframe->a0 = p->exec(init, argv);
+    if (p->trapframe->a0 == (uint64)-1) {
+      panic("exec");
+    }
   }
   kernel.interrupts.return_to_user();
 }
