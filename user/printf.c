@@ -15,7 +15,7 @@ putc(int fd, char c)
 static void
 printint(int fd, long long xx, int base, int sgn)
 {
-  char buf[20];
+  char buf[32];
   int i, neg;
   uint x;
 

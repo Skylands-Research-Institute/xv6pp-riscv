@@ -12,7 +12,7 @@ public:
   explicit interrupt_manager(const char *name);
   void init() override;
   void inithart();
-  void return_to_user();
+  void prepare_return();
   void clock_tick();
   int sleep(uint ticks);
   void sleep(void *chan, spin_lock &lk);
@@ -21,7 +21,7 @@ public:
   }
 
   void kernel_interrupt();
-  void user_interrupt();
+  uint64 user_interrupt();
   int device_interrupt();
 
   void intr_on() const;

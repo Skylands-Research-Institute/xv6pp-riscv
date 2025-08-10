@@ -75,7 +75,6 @@ void uart16550_driver::uartstart() {
   while (1) {
     if (uart_tx_w == uart_tx_r) {
       // transmit buffer is empty.
-      ReadReg(ISR);
       return;
     }
 
@@ -122,6 +121,7 @@ int uart16550_driver::getc() {
 }
 
 void uart16550_driver::handle_interrupt() {
+  ReadReg(ISR); // acknowledge the interrupt
   // read and process incoming characters.
   while (1) {
     int c = kernel.console_device.getc();

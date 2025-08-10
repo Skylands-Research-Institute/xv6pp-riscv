@@ -23,8 +23,11 @@ void process_scheduler::run() const {
   for (;;) {
     // The most recent process to run may have had interrupts
     // turned off; enable them to avoid a deadlock if all
-    // processes are waiting.
+    // processes are waiting. Then turn them back off
+    // to avoid a possible race between an interrupt
+    // and wfi.
     intr_on();
+    intr_off();
     bool found = false;
     for (auto p = kernel.processes.processes; p < &kernel.processes.processes[NPROC]; p++) {
       lock_guard<spin_lock> g(p->lock);
@@ -43,7 +46,6 @@ void process_scheduler::run() const {
     }
     if (!found) {
       // nothing to run; stop running on this core until an interrupt.
-      intr_on();
       asm volatile("wfi");
     }
   }
