@@ -12,8 +12,8 @@ void kerneltrap() {
   kernel.interrupts.kernel_interrupt();
 }
 
-void usertrap() {
-  kernel.interrupts.user_interrupt();
+uint64 usertrap() {
+  return kernel.interrupts.user_interrupt();
 }
 }
 
@@ -43,7 +43,7 @@ void interrupt_manager::inithart() {
   *(uint32*) PLIC_SPRIORITY(hart) = 0;
 }
 
-void interrupt_manager::return_to_user() {
+void interrupt_manager::prepare_return() {
   process *p = kernel.cpus.curproc();
   // we're about to switch the destination of traps from
   // kerneltrap() to usertrap(), so turn off interrupts until
@@ -67,13 +67,6 @@ void interrupt_manager::return_to_user() {
   w_sstatus(x);
   // set S Exception Program Counter to the saved user pc.
   w_sepc(p->trapframe->epc);
-  // tell trampoline.S the user page table to switch to.
-  uint64 satp = MAKE_SATP(p->pagetable);
-  // jump to userret in trampoline.S at the top of memory, which
-  // switches to the user page table, restores user registers,
-  // and switches to user mode with sret.
-  uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
-  ((void (*)(uint64)) trampoline_userret)(satp);
 }
 
 void interrupt_manager::clock_tick() {
@@ -160,7 +153,7 @@ void interrupt_manager::kernel_interrupt() {
   w_sstatus(sstatus);
 }
 
-void interrupt_manager::user_interrupt() {
+uint64 interrupt_manager::user_interrupt() {
   int which_dev = 0;
   if ((r_sstatus() & SSTATUS_SPP) != 0)
     panic("usertrap: not from user mode");
@@ -193,7 +186,11 @@ void interrupt_manager::user_interrupt() {
   // give up the CPU if this is a timer interrupt.
   if (which_dev == 2)
     kernel.scheduler.yield(p);
-  return_to_user();
+  prepare_return();
+  // the user page table to switch to, for trampoline.S
+  uint64 satp = MAKE_SATP(p->pagetable);
+  // return to trampoline.S; satp value in a0.
+  return satp;
 }
 
 int interrupt_manager::device_interrupt() {

@@ -2,7 +2,7 @@
 #include "xv6pp.h"
 #include "lock_guard.h"
 
-extern char trampoline[]; // trampoline.S
+extern char trampoline[], userret[]; // trampoline.S
 
 process_manager::process_manager(const char *name) :
     kernel_module(name), lock(name), pid_lock("pid_lock"), wait_lock(
@@ -40,25 +40,9 @@ int process_manager::get_next_pid() {
 }
 
 void process_manager::initial_process() {
-  // a user program that calls exec("/init")
-  // assembled from ../user/initcode.S
-  // od -t xC ../user/initcode
-  uchar initcode[] = { 0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x45, 0x02, 0x97,
-      0x05, 0x00, 0x00, 0x93, 0x85, 0x35, 0x02, 0x93, 0x08, 0x70, 0x00, 0x73,
-      0x00, 0x00, 0x00, 0x93, 0x08, 0x20, 0x00, 0x73, 0x00, 0x00, 0x00, 0xef,
-      0xf0, 0x9f, 0xff, 0x2f, 0x69, 0x6e, 0x69, 0x74, 0x00, 0x00, 0x24, 0x00,
-      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-  process *p = alloc();
+  auto p = alloc();
   initprocess = p;
-  // allocate one user page and copy initcode's instructions
-  // and data into it.
-  kernel.memory.first(p->pagetable, initcode, sizeof(initcode));
-  p->sz = PGSIZE;
-  // prepare for the very first "return" from kernel to user.
-  p->trapframe->epc = 0;      // user program counter
-  p->trapframe->sp = PGSIZE;  // user stack pointer
-  safestrcpy(p->name, "initcode", sizeof(p->name));
-  p->cwd = kernel.fsystem.namei((char*) "/");
+  p->cwd = kernel.fsystem.namei((char*)"/");
   p->state = process::process_state::RUNNABLE;
   p->lock.release();
 }
@@ -116,8 +100,9 @@ void process_manager::free(process *p) {
 
 void process_manager::forkret() {
   static bool first = true;
+  process* p = kernel.cpus.curproc();
   // Still holding p->lock from scheduler.
-  kernel.cpus.curproc()->lock.release();
+  p->lock.release();
   if (first) {
     // File system initialization must be run in the context of a
     // regular process (e.g., because it calls sleep), and thus cannot
@@ -126,8 +111,20 @@ void process_manager::forkret() {
     first = false;
     // ensure other cores see first=0.
     __sync_synchronize();
+    // We can invoke exec() now that file system is initialized.
+    // Put the return value (argc) of exec into a0.
+    static char init[] = "/init";   // non-const to satisfy char*
+    char* argv[] = { init, nullptr };
+    p->trapframe->a0 = p->exec(init, argv);
+    if (p->trapframe->a0 == (uint64)-1) {
+      panic("exec");
+    }
   }
-  kernel.interrupts.return_to_user();
+  // return to user space, mimicing usertrap()'s return.
+  kernel.interrupts.prepare_return();
+  uint64 satp = MAKE_SATP(p->pagetable);
+  uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
+  ((void (*)(uint64))trampoline_userret)(satp);
 }
 
 pagetable_t process_manager::create_pagetable(process *p) {

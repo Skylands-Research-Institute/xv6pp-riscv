@@ -19,7 +19,7 @@ static struct {
 static char digits[] = "0123456789abcdef";
 
 static void printint(long long xx, int base, int sign) {
-  char buf[16];
+  char buf[32];
   int i;
   unsigned long long x;
 
@@ -109,34 +109,6 @@ printptr (va_arg(ap, uint64));} else if(c0 == 's') {
   kernel.console.putc('%');
   kernel.console.putc(c0);
 }
-
-#if 0
-switch(c) {
-  case 'd':
-  printint(va_arg(ap, int), 10, 1);
-  break;
-  case 'x':
-  printint(va_arg(ap, int), 16, 1);
-  break;
-  case 'p':
-  printptr(va_arg(ap, uint64));
-  break;
-  case 's':
-  if((s = va_arg(ap, char*)) == 0)
-  s = "(null)";
-  for(; *s; s++)
-  kernel.console.putc(*s);
-  break;
-  case '%':
-  kernel.console.putc('%');
-  break;
-  default:
-  // Print unknown % sequence to draw attention.
-  kernel.console.putc('%');
-  kernel.console.putc(c);
-  break;
-}
-#endif
 }
   va_end(ap);
 
