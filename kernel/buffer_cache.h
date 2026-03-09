@@ -28,6 +28,12 @@ private:
 public:
   explicit buffer_cache(const char *name);
   void init() override;
+
+private:
+  friend class buffer_guard;
+  friend class file_system;
+  friend class file_system_log;
+
   buf* read(uint device, uint block);
   void relse(buf *b);
   void write(buf *b);
