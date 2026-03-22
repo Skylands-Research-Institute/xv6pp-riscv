@@ -21,7 +21,13 @@ struct inode {
   uint addrs[NDIRECT + 1];
 };
 
+class inode_lock_guard;
+class inode_ref_guard;
+
 class file_system final : public kernel_module {
+  friend class inode_lock_guard;
+  friend class inode_ref_guard;
+
 private:
   // there should be one superblock per disk device, but we run with
   // only one device
@@ -36,6 +42,9 @@ private:
   struct inode* namex(char *path, int nameiparent, char *name);
   char* skipelem(char *path, char *name);
   uint bmap(struct inode *ip, uint bn);
+  void ilock(struct inode*);
+  void iput(struct inode*);
+  void iunlock(struct inode*);
 
 public:
   explicit file_system(const char *name);
@@ -46,9 +55,6 @@ public:
   struct inode* dirlookup(struct inode*, char*, uint*);
   struct inode* ialloc(uint, short);
   struct inode* idup(struct inode*);
-  void ilock(struct inode*);
-  void iput(struct inode*);
-  void iunlock(struct inode*);
   void iunlockput(struct inode*);
   void iupdate(struct inode*);
   int namecmp(const char*, const char*);
@@ -59,4 +65,3 @@ public:
   int writei(struct inode*, int, uint64, uint, uint);
   void itrunc(struct inode*);
 };
-

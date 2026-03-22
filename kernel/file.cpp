@@ -4,7 +4,10 @@
 #include "file.h"
 #include "xv6pp.h"
 #include "spin_lock.h"
+#include "inode_lock_guard.h"
+#include "inode_ref_guard.h"
 #include "lock_guard.h"
+#include "log_op_guard.h"
 
 file::file() {
   type = file_type::FD_NONE;
@@ -32,9 +35,8 @@ void file::close() {
   if (ff.type == FD_PIPE) {
     ff.pp->close(ff.writable);
   } else if (ff.type == FD_INODE || ff.type == FD_DEVICE) {
-    kernel.log.begin_op();
-    kernel.fsystem.iput(ff.ip);
-    kernel.log.end_op();
+    log_op_guard log_guard;
+    inode_ref_guard ip_ref(ff.ip);
   }
 }
 
@@ -56,10 +58,9 @@ int file::read(uint64 addr, int n) {
       return -1;
     r = devsw[major].read(1, addr, n);
   } else if (type == FD_INODE) {
-    kernel.fsystem.ilock(ip);
+    inode_lock_guard ip_guard(ip);
     if ((r = kernel.fsystem.readi(ip, 1, addr, off, n)) > 0)
       off += r;
-    kernel.fsystem.iunlock(ip);
   } else {
     panic("fileread");
   }
@@ -69,9 +70,8 @@ int file::read(uint64 addr, int n) {
 int file::stat(uint64 addr) {
   struct stat st;
   if (type == FD_INODE || type == FD_DEVICE) {
-    kernel.fsystem.ilock(ip);
+    inode_lock_guard ip_guard(ip);
     kernel.fsystem.stati(ip, &st);
-    kernel.fsystem.iunlock(ip);
     if (kernel.memory.copyout(kernel.cpus.curproc()->get_pagetable(), addr,
         (char*) &st, sizeof(st)) < 0)
       return -1;
@@ -103,12 +103,10 @@ int file::write(uint64 addr, int n) {
       int n1 = n - i;
       if (n1 > max)
         n1 = max;
-      kernel.log.begin_op();
-      kernel.fsystem.ilock(ip);
+      log_op_guard log_guard;
+      inode_lock_guard ip_guard(ip);
       if ((r = kernel.fsystem.writei(ip, 1, addr + i, off, n1)) > 0)
         off += r;
-      kernel.fsystem.iunlock(ip);
-      kernel.log.end_op();
       if (r != n1) {
         // error from writei
         break;
@@ -121,4 +119,3 @@ int file::write(uint64 addr, int n) {
   }
   return ret;
 }
-

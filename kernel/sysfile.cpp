@@ -13,6 +13,11 @@
 #include "fcntl.h"
 #include "xv6pp.h"
 #include "file_manager.h"
+#include "file_ref_guard.h"
+#include "inode_lock_guard.h"
+#include "inode_ref_guard.h"
+#include "log_op_guard.h"
+#include "page_ref_guard.h"
 #include "syscall_args.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
@@ -88,8 +93,8 @@ uint64 sys_close(void) {
 
   if (argfd(0, &fd, &f) < 0)
     return -1;
+  file_ref_guard f_ref(f);
   kernel.cpus.curproc()->set_ofile(fd, nullptr);
-  f->close();
   return 0;
 }
 
@@ -106,47 +111,36 @@ uint64 sys_fstat(void) {
 // Create the path new as a link to the same inode as old.
 uint64 sys_link(void) {
   char name[DIRSIZ], newp[MAXPATH], old[MAXPATH];
-  struct inode *dp, *ip;
 
   if (argstr(0, old, MAXPATH) < 0 || argstr(1, newp, MAXPATH) < 0)
     return -1;
 
-  kernel.log.begin_op();
-  if ((ip = kernel.fsystem.namei(old)) == 0) {
-    kernel.log.end_op();
+  log_op_guard log_guard;
+  inode_ref_guard ip_ref(kernel.fsystem.namei(old));
+  if (!ip_ref) {
     return -1;
   }
 
-  kernel.fsystem.ilock(ip);
-  if (ip->type == T_DIR) {
-    kernel.fsystem.iunlockput(ip);
-    kernel.log.end_op();
+  inode_lock_guard ip_lock(ip_ref.get());
+  if (ip_ref.get()->type == T_DIR) {
     return -1;
   }
 
-  ip->nlink++;
-  kernel.fsystem.iupdate(ip);
-  kernel.fsystem.iunlock(ip);
+  ip_ref.get()->nlink++;
+  kernel.fsystem.iupdate(ip_ref.get());
+  ip_lock.unlock();
 
-  if ((dp = kernel.fsystem.nameiparent(newp, name)) == 0)
-    goto bad;
-  kernel.fsystem.ilock(dp);
-  if (dp->dev != ip->dev || kernel.fsystem.dirlink(dp, name, ip->inum) < 0) {
-    kernel.fsystem.iunlockput(dp);
-    goto bad;
+  inode_ref_guard dp_ref(kernel.fsystem.nameiparent(newp, name));
+  if (dp_ref) {
+    inode_lock_guard dp_lock(dp_ref.get());
+    if (dp_ref.get()->dev == ip_ref.get()->dev && kernel.fsystem.dirlink(dp_ref.get(), name, ip_ref.get()->inum) >= 0) {
+      return 0;
+    }
   }
-  kernel.fsystem.iunlockput(dp);
-  kernel.fsystem.iput(ip);
 
-  kernel.log.end_op();
-
-  return 0;
-
-  bad: kernel.fsystem.ilock(ip);
-  ip->nlink--;
-  kernel.fsystem.iupdate(ip);
-  kernel.fsystem.iunlockput(ip);
-  kernel.log.end_op();
+  ip_lock.reset(ip_ref.get());
+  ip_ref.get()->nlink--;
+  kernel.fsystem.iupdate(ip_ref.get());
   return -1;
 }
 
@@ -164,7 +158,6 @@ static int isdirempty(struct inode *dp) {
 }
 
 uint64 sys_unlink(void) {
-  struct inode *ip, *dp;
   struct dirent de;
   char name[DIRSIZ], path[MAXPATH];
   uint off;
@@ -172,232 +165,226 @@ uint64 sys_unlink(void) {
   if (argstr(0, path, MAXPATH) < 0)
     return -1;
 
-  kernel.log.begin_op();
-  if ((dp = kernel.fsystem.nameiparent(path, name)) == 0) {
-    kernel.log.end_op();
+  log_op_guard log_guard;
+  inode_ref_guard dp_ref(kernel.fsystem.nameiparent(path, name));
+  if (!dp_ref) {
     return -1;
   }
 
-  kernel.fsystem.ilock(dp);
+  inode_lock_guard dp_lock(dp_ref.get());
 
   // Cannot unlink "." or "..".
   if (kernel.fsystem.namecmp(name, ".") == 0 || kernel.fsystem.namecmp(name, "..") == 0)
-    goto bad;
+    return -1;
 
-  if ((ip = kernel.fsystem.dirlookup(dp, name, &off)) == 0)
-    goto bad;
-  kernel.fsystem.ilock(ip);
+  inode_ref_guard ip_ref(kernel.fsystem.dirlookup(dp_ref.get(), name, &off));
+  if (!ip_ref)
+    return -1;
 
-  if (ip->nlink < 1)
+  inode_lock_guard ip_lock(ip_ref.get());
+  if (ip_ref.get()->nlink < 1)
     panic("unlink: nlink < 1");
-  if (ip->type == T_DIR && !isdirempty(ip)) {
-    kernel.fsystem.iunlockput(ip);
-    goto bad;
-  }
+  if (ip_ref.get()->type == T_DIR && !isdirempty(ip_ref.get()))
+    return -1;
 
   memset(&de, 0, sizeof(de));
-  if (kernel.fsystem.writei(dp, 0, (uint64) &de, off, sizeof(de)) != sizeof(de))
+  if (kernel.fsystem.writei(dp_ref.get(), 0, (uint64) &de, off, sizeof(de)) != sizeof(de))
     panic("unlink: writei");
-  if (ip->type == T_DIR) {
-    dp->nlink--;
-    kernel.fsystem.iupdate(dp);
+  if (ip_ref.get()->type == T_DIR) {
+    dp_ref.get()->nlink--;
+    kernel.fsystem.iupdate(dp_ref.get());
   }
-  kernel.fsystem.iunlockput(dp);
+  dp_lock.unlock();
+  dp_ref.reset();
 
-  ip->nlink--;
-  kernel.fsystem.iupdate(ip);
-  kernel.fsystem.iunlockput(ip);
-
-  kernel.log.end_op();
+  ip_ref.get()->nlink--;
+  kernel.fsystem.iupdate(ip_ref.get());
 
   return 0;
-
-  bad: kernel.fsystem.iunlockput(dp);
-  kernel.log.end_op();
-  return -1;
 }
 
 static struct inode*
 create(char *path, short type, short major, short minor) {
-  struct inode *ip, *dp;
   char name[DIRSIZ];
 
-  if ((dp = kernel.fsystem.nameiparent(path, name)) == 0)
+  inode_ref_guard dp_ref(kernel.fsystem.nameiparent(path, name));
+  if (!dp_ref)
     return 0;
 
-  kernel.fsystem.ilock(dp);
+  inode_lock_guard dp_lock(dp_ref.get());
 
-  if ((ip = kernel.fsystem.dirlookup(dp, name, 0)) != 0) {
-    kernel.fsystem.iunlockput(dp);
-    kernel.fsystem.ilock(ip);
-    if (type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
-      return ip;
-    kernel.fsystem.iunlockput(ip);
+  inode_ref_guard ip_ref(kernel.fsystem.dirlookup(dp_ref.get(), name, 0));
+  if (ip_ref) {
+    dp_lock.unlock();
+    dp_ref.reset();
+    inode_lock_guard ip_lock(ip_ref.get());
+    if (type == T_FILE && (ip_ref.get()->type == T_FILE || ip_ref.get()->type == T_DEVICE)) {
+      ip_lock.release();
+      return ip_ref.release();
+    }
     return 0;
   }
 
-  if ((ip = kernel.fsystem.ialloc(dp->dev, type)) == 0) {
-    kernel.fsystem.iunlockput(dp);
+  ip_ref.reset(kernel.fsystem.ialloc(dp_ref.get()->dev, type));
+  if (!ip_ref) {
     return 0;
   }
 
-  kernel.fsystem.ilock(ip);
-  ip->major = major;
-  ip->minor = minor;
-  ip->nlink = 1;
-  kernel.fsystem.iupdate(ip);
+  inode_lock_guard ip_lock(ip_ref.get());
+  ip_ref.get()->major = major;
+  ip_ref.get()->minor = minor;
+  ip_ref.get()->nlink = 1;
+  kernel.fsystem.iupdate(ip_ref.get());
 
   if (type == T_DIR) {  // Create . and .. entries.
     // No ip->nlink++ for ".": avoid cyclic ref count.
-    if (kernel.fsystem.dirlink(ip, (char*) ".", ip->inum) < 0 || kernel.fsystem.dirlink(ip, (char*) "..", dp->inum) < 0)
+    if (kernel.fsystem.dirlink(ip_ref.get(), (char*) ".", ip_ref.get()->inum) < 0
+        || kernel.fsystem.dirlink(ip_ref.get(), (char*) "..", dp_ref.get()->inum) < 0)
       goto fail;
   }
 
-  if (kernel.fsystem.dirlink(dp, name, ip->inum) < 0)
+  if (kernel.fsystem.dirlink(dp_ref.get(), name, ip_ref.get()->inum) < 0)
     goto fail;
 
   if (type == T_DIR) {
     // now that success is guaranteed:
-    dp->nlink++;  // for ".."
-    kernel.fsystem.iupdate(dp);
+    dp_ref.get()->nlink++;  // for ".."
+    kernel.fsystem.iupdate(dp_ref.get());
   }
 
-  kernel.fsystem.iunlockput(dp);
-
-  return ip;
+  dp_lock.unlock();
+  dp_ref.reset();
+  ip_lock.release();
+  return ip_ref.release();
 
   fail:
   // something went wrong. de-allocate ip.
-  ip->nlink = 0;
-  kernel.fsystem.iupdate(ip);
-  kernel.fsystem.iunlockput(ip);
-  kernel.fsystem.iunlockput(dp);
+  ip_ref.get()->nlink = 0;
+  kernel.fsystem.iupdate(ip_ref.get());
   return 0;
 }
 
 uint64 sys_open(void) {
   char path[MAXPATH];
   int fd, omode;
-  file *f;
-  struct inode *ip;
   int n;
 
   argint(1, &omode);
   if ((n = argstr(0, path, MAXPATH)) < 0)
     return -1;
 
-  kernel.log.begin_op();
+  log_op_guard log_guard;
+  inode_ref_guard ip_ref;
+  inode_lock_guard ip_lock;
 
   if (omode & O_CREATE) {
-    ip = create(path, T_FILE, 0, 0);
-    if (ip == 0) {
-      kernel.log.end_op();
+    ip_ref.reset(create(path, T_FILE, 0, 0));
+    if (!ip_ref) {
       return -1;
     }
+    ip_lock.adopt(ip_ref.get());
   } else {
-    if ((ip = kernel.fsystem.namei(path)) == 0) {
-      kernel.log.end_op();
+    ip_ref.reset(kernel.fsystem.namei(path));
+    if (!ip_ref) {
       return -1;
     }
-    kernel.fsystem.ilock(ip);
-    if (ip->type == T_DIR && omode != O_RDONLY) {
-      kernel.fsystem.iunlockput(ip);
-      kernel.log.end_op();
+    ip_lock.reset(ip_ref.get());
+    if (ip_ref.get()->type == T_DIR && omode != O_RDONLY) {
       return -1;
     }
   }
 
-  if (ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)) {
-    kernel.fsystem.iunlockput(ip);
-    kernel.log.end_op();
+  if (ip_ref.get()->type == T_DEVICE && (ip_ref.get()->major < 0 || ip_ref.get()->major >= NDEV)) {
     return -1;
   }
 
-  if ((f = kernel.fmanager.alloc_file()) == 0 || (fd = fdalloc(f)) < 0) {
-    if (f)
-      f->close();
-    kernel.fsystem.iunlockput(ip);
-    kernel.log.end_op();
+  file_ref_guard f_ref(kernel.fmanager.alloc_file());
+  if (!f_ref || (fd = fdalloc(f_ref.get())) < 0) {
     return -1;
   }
 
-  if (ip->type == T_DEVICE) {
-    f->set_type(file::FD_DEVICE);
-    f->set_major(ip->major);
+  if (ip_ref.get()->type == T_DEVICE) {
+    f_ref.get()->set_type(file::FD_DEVICE);
+    f_ref.get()->set_major(ip_ref.get()->major);
   } else {
-    f->set_type(file::FD_INODE);
-    f->set_off(0);
+    f_ref.get()->set_type(file::FD_INODE);
+    f_ref.get()->set_off(0);
   }
-  f->set_ip(ip);
-  f->set_readable(!(omode & O_WRONLY));
-  f->set_writable((omode & O_WRONLY) || (omode & O_RDWR));
+  f_ref.get()->set_ip(ip_ref.get());
+  f_ref.get()->set_readable(!(omode & O_WRONLY));
+  f_ref.get()->set_writable((omode & O_WRONLY) || (omode & O_RDWR));
 
-  if ((omode & O_TRUNC) && ip->type == T_FILE) {
-    kernel.fsystem.itrunc(ip);
+  if ((omode & O_TRUNC) && ip_ref.get()->type == T_FILE) {
+    kernel.fsystem.itrunc(ip_ref.get());
   }
 
-  kernel.fsystem.iunlock(ip);
-  kernel.log.end_op();
+  ip_lock.unlock();
+  ip_ref.release();
+  f_ref.release();
 
   return fd;
 }
 
 uint64 sys_mkdir(void) {
   char path[MAXPATH];
-  struct inode *ip;
 
-  kernel.log.begin_op();
-  if (argstr(0, path, MAXPATH) < 0 || (ip = create(path, T_DIR, 0, 0)) == 0) {
-    kernel.log.end_op();
+  log_op_guard log_guard;
+  if (argstr(0, path, MAXPATH) < 0) {
     return -1;
   }
-  kernel.fsystem.iunlockput(ip);
-  kernel.log.end_op();
+  inode_ref_guard ip_ref(create(path, T_DIR, 0, 0));
+  if (!ip_ref) {
+    return -1;
+  }
+  inode_lock_guard ip_lock;
+  ip_lock.adopt(ip_ref.get());
   return 0;
 }
 
 uint64 sys_mknod(void) {
-  struct inode *ip;
   char path[MAXPATH];
   int major, minor;
 
-  kernel.log.begin_op();
+  log_op_guard log_guard;
   argint(1, &major);
   argint(2, &minor);
-  if ((argstr(0, path, MAXPATH)) < 0 || (ip = create(path, T_DEVICE, major, minor)) == 0) {
-    kernel.log.end_op();
+  if ((argstr(0, path, MAXPATH)) < 0) {
     return -1;
   }
-  kernel.fsystem.iunlockput(ip);
-  kernel.log.end_op();
+  inode_ref_guard ip_ref(create(path, T_DEVICE, major, minor));
+  if (!ip_ref) {
+    return -1;
+  }
+  inode_lock_guard ip_lock;
+  ip_lock.adopt(ip_ref.get());
   return 0;
 }
 
 uint64 sys_chdir(void) {
   char path[MAXPATH];
-  struct inode *ip;
   process *p = kernel.cpus.curproc();
 
-  kernel.log.begin_op();
-  if (argstr(0, path, MAXPATH) < 0 || (ip = kernel.fsystem.namei(path)) == 0) {
-    kernel.log.end_op();
+  log_op_guard log_guard;
+  if (argstr(0, path, MAXPATH) < 0) {
     return -1;
   }
-  kernel.fsystem.ilock(ip);
-  if (ip->type != T_DIR) {
-    kernel.fsystem.iunlockput(ip);
-    kernel.log.end_op();
+  inode_ref_guard ip_ref(kernel.fsystem.namei(path));
+  if (!ip_ref) {
     return -1;
   }
-  kernel.fsystem.iunlock(ip);
-  kernel.fsystem.iput(p->get_cwd());
-  kernel.log.end_op();
-  p->set_cwd(ip);
+  inode_lock_guard ip_lock(ip_ref.get());
+  if (ip_ref.get()->type != T_DIR) {
+    return -1;
+  }
+  ip_lock.unlock();
+  inode_ref_guard cwd_ref(p->get_cwd());
+  p->set_cwd(ip_ref.release());
   return 0;
 }
 
 uint64 sys_exec(void) {
   char path[MAXPATH], *argv[MAXARG];
+  page_ref_guard arg_guards[MAXARG];
   int i;
   uint64 uargv, uarg;
 
@@ -416,7 +403,8 @@ uint64 sys_exec(void) {
       argv[i] = 0;
       break;
     } else {
-      argv[i] = (char*) kernel.allocator.alloc();
+      arg_guards[i].reset(kernel.allocator.alloc());
+      argv[i] = (char*) arg_guards[i].get();
       if (argv[i] == 0)
         bad = true;
       else if (fetchstr(uarg, argv[i], PGSIZE) < 0)
@@ -424,17 +412,11 @@ uint64 sys_exec(void) {
     }
   }
 
-  if (bad) {
-    for (i = 0; i < (int) NELEM(argv) && argv[i] != 0; i++)
-      kernel.allocator.free(argv[i]);
+  if (bad)
     return -1;
-  }
 
   //int ret = exec(path, argv);
   int ret = kernel.cpus.curproc()->exec(path, argv);
-
-  for (i = 0; i < (int) NELEM(argv) && argv[i] != 0; i++)
-    kernel.allocator.free(argv[i]);
 
   return ret;
 
@@ -442,28 +424,28 @@ uint64 sys_exec(void) {
 
 uint64 sys_pipe(void) {
   uint64 fdarray; // user pointer to array of two integers
-  file *rf, *wf;
   int fd0, fd1;
   process *p = kernel.cpus.curproc();
 
   argaddr(0, &fdarray);
+  file *rf = nullptr, *wf = nullptr;
   if (kernel.fmanager.alloc_pipe(&rf, &wf) < 0)
     return -1;
+  file_ref_guard rf_ref(rf);
+  file_ref_guard wf_ref(wf);
   fd0 = -1;
-  if ((fd0 = fdalloc(rf)) < 0 || (fd1 = fdalloc(wf)) < 0) {
+  if ((fd0 = fdalloc(rf_ref.get())) < 0 || (fd1 = fdalloc(wf_ref.get())) < 0) {
     if (fd0 >= 0)
       p->set_ofile(fd0, nullptr);
-    rf->close();
-    wf->close();
     return -1;
   }
   if (kernel.memory.copyout(p->get_pagetable(), fdarray, (char*) &fd0, sizeof(fd0)) < 0
       || kernel.memory.copyout(p->get_pagetable(), fdarray + sizeof(fd0), (char*) &fd1, sizeof(fd1)) < 0) {
     p->set_ofile(fd0, nullptr);
     p->set_ofile(fd1, nullptr);
-    rf->close();
-    wf->close();
     return -1;
   }
+  rf_ref.release();
+  wf_ref.release();
   return 0;
 }

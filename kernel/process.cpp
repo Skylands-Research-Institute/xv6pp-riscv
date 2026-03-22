@@ -2,7 +2,11 @@
 #include "elf.h"
 #include "process.h"
 #include "xv6pp.h"
+#include "file_ref_guard.h"
+#include "inode_lock_guard.h"
+#include "inode_ref_guard.h"
 #include "lock_guard.h"
+#include "log_op_guard.h"
 
 process::process() {
 }
@@ -102,13 +106,9 @@ static inline int flags2perm(int flags) {
   return perm;
 }
 
-static inline int error(pagetable_t newpagetable, uint64 newsz, struct inode *ip) {
+static inline int error(pagetable_t newpagetable, uint64 newsz) {
   if (newpagetable)
     kernel.processes.free_pagetable(newpagetable, newsz);
-  if (ip) {
-    kernel.fsystem.iunlockput(ip);
-    kernel.log.end_op();
-  }
   return -1;
 }
 
@@ -117,50 +117,46 @@ int process::exec(char *path, char **argv) {
   int i, off;
   uint64 argc, newsz = 0, sp, ustack[MAXARG], stackbase;
   struct elfhdr elf;
-  struct inode *ip;
   struct proghdr ph;
   pagetable_t newpagetable = 0, oldpagetable;
 
-  kernel.log.begin_op();
+  {
+    log_op_guard log_guard;
+    inode_ref_guard ip_ref(kernel.fsystem.namei(path));
+    if (!ip_ref)
+      return error(newpagetable, newsz);
+    inode_lock_guard ip_lock(ip_ref.get());
 
-  if ((ip = kernel.fsystem.namei(path)) == 0) {
-    kernel.log.end_op();
-    return -1;
+    // Check ELF header
+    if (kernel.fsystem.readi(ip_ref.get(), 0, (uint64) &elf, 0, sizeof(elf)) != sizeof(elf))
+      return error(newpagetable, newsz);
+
+    if (elf.magic != ELF_MAGIC)
+      return error(newpagetable, newsz);
+
+    if (!(newpagetable = kernel.processes.create_pagetable(this)))
+      return error(newpagetable, newsz);
+
+    // Load program into memory.
+    for (i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
+      if (kernel.fsystem.readi(ip_ref.get(), 0, (uint64) &ph, off, sizeof(ph)) != sizeof(ph))
+        return error(newpagetable, newsz);
+      if (ph.type != ELF_PROG_LOAD)
+        continue;
+      if (ph.memsz < ph.filesz)
+        return error(newpagetable, newsz);
+      if (ph.vaddr + ph.memsz < ph.vaddr)
+        return error(newpagetable, newsz);
+      if (ph.vaddr % PGSIZE != 0)
+        return error(newpagetable, newsz);
+      uint64 sz1;
+      if ((sz1 = kernel.memory.alloc(newpagetable, newsz, ph.vaddr + ph.memsz, flags2perm(ph.flags))) == 0)
+        return error(newpagetable, newsz);
+      newsz = sz1;
+      if (loadseg(newpagetable, ph.vaddr, ip_ref.get(), ph.off, ph.filesz) < 0)
+        return error(newpagetable, newsz);
+    }
   }
-  kernel.fsystem.ilock(ip);
-
-  // Check ELF header
-  if (kernel.fsystem.readi(ip, 0, (uint64) &elf, 0, sizeof(elf)) != sizeof(elf))
-    return error(newpagetable, newsz, ip);
-
-  if (elf.magic != ELF_MAGIC)
-    return error(newpagetable, newsz, ip);
-
-  if (!(newpagetable = kernel.processes.create_pagetable(this)))
-    return error(newpagetable, newsz, ip);
-
-  // Load program into memory.
-  for (i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
-    if (kernel.fsystem.readi(ip, 0, (uint64) &ph, off, sizeof(ph)) != sizeof(ph))
-      return error(newpagetable, newsz, ip);
-    if (ph.type != ELF_PROG_LOAD)
-      continue;
-    if (ph.memsz < ph.filesz)
-      return error(newpagetable, newsz, ip);
-    if (ph.vaddr + ph.memsz < ph.vaddr)
-      return error(newpagetable, newsz, ip);
-    if (ph.vaddr % PGSIZE != 0)
-      return error(newpagetable, newsz, ip);
-    uint64 sz1;
-    if ((sz1 = kernel.memory.alloc(newpagetable, newsz, ph.vaddr + ph.memsz, flags2perm(ph.flags))) == 0)
-      return error(newpagetable, newsz, ip);
-    newsz = sz1;
-    if (loadseg(newpagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
-      return error(newpagetable, newsz, ip);
-  }
-  kernel.fsystem.iunlockput(ip);
-  kernel.log.end_op();
-  ip = 0;
 
   uint64 oldsz = sz;
 
@@ -170,7 +166,7 @@ int process::exec(char *path, char **argv) {
   newsz = PGROUNDUP(newsz);
   uint64 sz1;
   if ((sz1 = kernel.memory.alloc(newpagetable, newsz, newsz + (USERSTACK + 1) * PGSIZE, PTE_W)) == 0)
-    return error(newpagetable, newsz, ip);
+    return error(newpagetable, newsz);
   newsz = sz1;
   kernel.memory.clear(newpagetable, newsz - (USERSTACK + 1) * PGSIZE);
   sp = newsz;
@@ -179,13 +175,13 @@ int process::exec(char *path, char **argv) {
   // Push argument strings, prepare rest of stack in ustack.
   for (argc = 0; argv[argc]; argc++) {
     if (argc >= MAXARG)
-      return error(newpagetable, newsz, ip);
+      return error(newpagetable, newsz);
     sp -= strlen(argv[argc]) + 1;
     sp -= sp % 16; // riscv sp must be 16-byte aligned
     if (sp < stackbase)
-      return error(newpagetable, newsz, ip);
+      return error(newpagetable, newsz);
     if (kernel.memory.copyout(newpagetable, sp, argv[argc], strlen(argv[argc]) + 1) < 0)
-      return error(newpagetable, newsz, ip);
+      return error(newpagetable, newsz);
     ustack[argc] = sp;
   }
   ustack[argc] = 0;
@@ -194,9 +190,9 @@ int process::exec(char *path, char **argv) {
   sp -= (argc + 1) * sizeof(uint64);
   sp -= sp % 16;
   if (sp < stackbase)
-    return error(newpagetable, newsz, ip);
+    return error(newpagetable, newsz);
   if (kernel.memory.copyout(newpagetable, sp, (char*) ustack, (argc + 1) * sizeof(uint64)) < 0)
-    return error(newpagetable, newsz, ip);
+    return error(newpagetable, newsz);
 
   // arguments to user main(argc, argv)
   // argc is returned via the system call return
@@ -226,14 +222,14 @@ void process::exit(int status) {
   // Close all open files.
   for (int fd = 0; fd < NOFILE; fd++) {
     if (ofile[fd]) {
-      auto f = ofile[fd];
-      f->close();
+      file_ref_guard f_ref(ofile[fd]);
       ofile[fd] = 0;
     }
   }
-  kernel.log.begin_op();
-  kernel.fsystem.iput(cwd);
-  kernel.log.end_op();
+  {
+    log_op_guard log_guard;
+    inode_ref_guard cwd_ref(cwd);
+  }
   cwd = 0;
   {
     lock_guard<spin_lock> g(kernel.processes.wait_lock);
@@ -280,4 +276,3 @@ void process::set_killed(bool k) {
   lock_guard<spin_lock> g(lock);
   killed = k;
 }
-

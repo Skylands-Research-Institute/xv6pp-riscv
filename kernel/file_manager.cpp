@@ -1,4 +1,5 @@
 #include "file_manager.h"
+#include "file_ref_guard.h"
 #include "lock_guard.h"
 
 struct devsw devsw[NDEV];
@@ -45,10 +46,7 @@ int file_manager::alloc_pipe(file **f0, file **f1) {
     (*f1)->pp = p;
     return 0;
   }
-  if (*f0)
-    (*f0)->close();
-  if (*f1)
-    (*f1)->close();
+  file_ref_guard f0_ref(*f0);
+  file_ref_guard f1_ref(*f1);
   return -1;
 }
-

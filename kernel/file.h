@@ -1,9 +1,11 @@
 #pragma once
 
 class pipe;
+class file_ref_guard;
 
 class file final {
   friend class file_manager;
+  friend class file_ref_guard;
 
 public:
   enum file_type {
@@ -20,9 +22,10 @@ private:
   uint off;           // FD_INODE
   short major;        // FD_DEVICE
 
+  void close();
+
 public:
   file();
-  void close();
   void dup();
   int read(uint64, int n);
   int stat(uint64 addr);
@@ -52,5 +55,4 @@ public:
     off = o;
   }
 };
-
 
