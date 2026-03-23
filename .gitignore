@@ -15,3 +15,7 @@ mkfs
 kernel/kernel
 user/usys.S
 .gdbinit
+.project
+.cproject
+xv6.out
+xv6pp.out
