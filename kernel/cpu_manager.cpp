@@ -1,4 +1,5 @@
 #include "xv6pp.h"
+#include "cpu_guard.h"
 #include "cpu_manager.h"
 
 cpu_manager::cpu_manager(const char *name) :
@@ -19,11 +20,8 @@ void cpu_manager::init() {
 }
 
 process* cpu_manager::curproc() {
-  push_off();
-  cpu_state &c = cpu();
-  process *p = c.curproc;
-  pop_off();
-  return p;
+  cpu_guard cg;
+  return cpu().curproc;
 }
 
 // Check whether this cpu is holding the lock.
@@ -54,4 +52,3 @@ void cpu_manager::pop_off(void) {
   if (!c.noff && c.intena)
     kernel.interrupts.intr_on();
 }
-

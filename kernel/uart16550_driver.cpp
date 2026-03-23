@@ -1,4 +1,5 @@
 #include "uart16550_driver.h"
+#include "cpu_guard.h"
 #include "page_allocator.h"
 #include "lock_guard.h"
 #include "sleep_lock.h"
@@ -140,7 +141,7 @@ void uart16550_driver::handle_interrupt() {
 // to echo characters. it spins waiting for the uart's
 // output register to be empty.
 void uart16550_driver::putc_sync(int c) {
-  kernel.cpus.push_off();
+  cpu_guard cg;
 
   if (panicked) {
     for (;;)
@@ -151,7 +152,4 @@ void uart16550_driver::putc_sync(int c) {
   while ((ReadReg(LSR) & LSR_TX_IDLE) == 0)
     ;
   WriteReg(THR, c);
-
-  kernel.cpus.pop_off();
 }
-
